@@ -5,8 +5,16 @@
 // pnet = "0.35.0"
 // ```
 
+// NOTE: run with:
+// cargo run --release -- --vec <path/to.cpap>
+// cargo run --release -- --heap <path/to.cpap>
+// hyperfine --warmup 3 'cargo run --release -- --vec <path/to.cpap>' 'cargo run --release -- --heap <path/to.cpap>'
+//
+// cargo run --release -- --heap <path/to.cpap> ran
+//   1.07 ± 0.01 times faster than cargo run --release -- --vec <path/to.cpap>
+
 use chrono::{DateTime, FixedOffset, TimeDelta, Utc};
-use pcap::Capture;
+use pcap::{Capture, Offline};
 use pnet::packet::{
     ethernet::{EtherTypes, EthernetPacket},
     ip::IpNextHeaderProtocols,
@@ -14,6 +22,10 @@ use pnet::packet::{
     udp::UdpPacket,
     Packet,
 };
+use std::{collections::BinaryHeap, fmt::Debug};
+
+/// The maximum delay between accept and packet times
+const MAX_DELAY: TimeDelta = TimeDelta::seconds(3);
 
 /// A convenient char array for issue codes.
 #[derive(Copy, Clone, Debug)]
@@ -30,6 +42,30 @@ impl TryFrom<&str> for IssueCode {
         let mut chars = str.chars();
 
         Ok(Self(std::array::from_fn(|_| chars.next().unwrap())))
+    }
+}
+
+/// A wrapper of `QuotePacket` to use `BinaryHeap` as a min-heap.
+#[derive(Copy, Clone, Debug)]
+pub struct OrdQuotePacket(QuotePacket);
+
+impl PartialEq for OrdQuotePacket {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.accept_time == other.0.accept_time
+    }
+}
+
+impl Eq for OrdQuotePacket {}
+
+impl PartialOrd for OrdQuotePacket {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrdQuotePacket {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.accept_time.cmp(&other.0.accept_time).reverse()
     }
 }
 
@@ -212,22 +248,30 @@ impl std::fmt::Display for QuotePacket {
 }
 
 fn main() {
-    const MAX_DELAY: TimeDelta = TimeDelta::seconds(3);
+    let mut path = None;
+    let mut is_vec = false;
+    let mut is_heap = false;
 
-    let mut capture = {
-        // NOTE: if this was a real CLI tool, we would use `clap`
-        let path = std::env::args()
-            .position(|arg| arg == "-r")
-            .and_then(|i| std::env::args().nth(i + 1))
-            .expect("Missing `-r <path/to/capture.pcap>`");
+    for arg in std::env::args() {
+        match arg.as_str() {
+            "--vec" => is_vec = true,
+            "--heap" => is_heap = true,
+            _ => path = Some(arg),
+        }
+    }
 
-        // NOTE: it seems like `libpcap` does not buffer the full file into memory!
-        // Otherwise, we'd have to dig into pcap specs and use a cursor to get relevant udp payloads
-        Capture::from_file(path).unwrap()
-    };
+    // NOTE: it seems like `libpcap` does not buffer the full file into memory!
+    // Otherwise, we'd have to dig into pcap specs and use a cursor to get relevant udp payloads
+    let capture = Capture::from_file(path.expect("Missing `-r <path/to/capture.pcap>`")).unwrap();
 
-    // A sliding window of quotes, always sorted by `accept_time`.
-    // NOTE: VecDeque gives no perf gains
+    match (is_vec, is_heap) {
+        (true, false) => with_vec(capture),
+        (false, true) => with_heap(capture),
+        _ => panic!("--vec XOR --heap"),
+    }
+}
+
+fn with_vec(mut capture: Capture<Offline>) {
     let mut window = Vec::<QuotePacket>::with_capacity(2048);
 
     while let Ok(packet) = capture.next_packet() {
@@ -252,5 +296,34 @@ fn main() {
     // Flush the remaining quotes
     for quote_packet in &window {
         println!("{quote_packet}");
+    }
+}
+
+fn with_heap(mut capture: Capture<Offline>) {
+    let mut window = BinaryHeap::<OrdQuotePacket>::with_capacity(2048);
+
+    while let Ok(packet) = capture.next_packet() {
+        if let Some(Ok(quote_packet)) = QuotePacket::try_from_packet(packet) {
+            // Flush buffered quotes older than the current one, taking MAX_DELAY into account
+            loop {
+                if let Some(quote_packet) = window
+                    .peek()
+                    .filter(|peek| peek.0.accept_time + MAX_DELAY < quote_packet.accept_time)
+                {
+                    println!("{}", quote_packet.0);
+                    window.pop().unwrap();
+                } else {
+                    break;
+                }
+            }
+
+            // Insert the current quote in the window
+            window.push(OrdQuotePacket(quote_packet));
+        }
+    }
+
+    // Flush the remaining quotes
+    while let Some(quote_packet) = window.pop() {
+        println!("{}", quote_packet.0);
     }
 }
